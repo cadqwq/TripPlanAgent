@@ -185,7 +185,9 @@ def attraction_agent(state: TripPlanState) -> dict:
 
 ```
 TripPlanAgent/
+├── docker-compose.yml                  # 一键启动
 ├── backend/
+│   ├── Dockerfile                      # 后端镜像
 │   ├── app/
 │   │   ├── agents/
 │   │   │   ├── trip_planner_agent.py   # LangGraph 图定义 + 5个Agent节点
@@ -196,10 +198,11 @@ TripPlanAgent/
 │   │   │   └── unsplash_service.py     # 图片搜索
 │   │   ├── models/schemas.py           # Pydantic 数据模型
 │   │   ├── api/routes/                 # FastAPI 路由
-│   │   └── config.py                   # 配置管理
+│   │   └── config.py                   # 配置管理 + loguru 日志配置
 │   ├── requirements.txt
 │   └── run.py
 ├── frontend/
+│   ├── Dockerfile                      # 前端镜像
 │   └── src/
 │       ├── views/Home.vue              # 旅行表单
 │       ├── views/Result.vue            # 计划展示
@@ -214,7 +217,24 @@ TripPlanAgent/
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 方式一：Docker（推荐，一键启动）
+
+```bash
+# 1. 配置 API 密钥
+cp backend/.env.example backend/.env
+# 编辑 backend/.env，填入你的 API 密钥
+
+# 2. 一键启动
+docker compose up
+
+# 3. 打开浏览器
+# 前端: http://localhost:5173
+# API 文档: http://localhost:8000/docs
+```
+
+### 方式二：手动启动
+
+#### 1. 安装依赖
 
 ```bash
 # 后端
@@ -226,7 +246,7 @@ cd frontend
 npm install
 ```
 
-### 2. 配置环境变量
+#### 2. 配置环境变量
 
 复制 `backend/.env.example` 为 `backend/.env`，填入 API 密钥：
 

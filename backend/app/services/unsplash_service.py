@@ -2,6 +2,7 @@
 
 import requests
 from typing import List, Optional
+from loguru import logger
 from ..config import get_settings
 
 
@@ -41,7 +42,7 @@ class UnsplashService:
 
           return photos
       except Exception as e:
-          print(f"❌  Unsplash搜索失败: {str(e)}")
+          logger.warning("Unsplash搜索失败 | error={}", str(e))
           return []
 
   def get_photo_url(self, query: str) -> Optional[str]:

@@ -1,6 +1,7 @@
 """LLM服务模块 — 基于 langchain-openai 封装 DeepSeek 大模型调用"""
 
 import os
+from loguru import logger
 from langchain_openai import ChatOpenAI
 from ..config import get_settings
 
@@ -30,13 +31,11 @@ def get_llm() -> ChatOpenAI:
             model=model,
             temperature=0.7,
             max_tokens=4096,
-            timeout=60,
+            timeout=180,
             max_retries=2,
         )
 
-        print(f"✅  LLM服务初始化成功 (langchain-openai)")
-        print(f"   模型: {model}")
-        print(f"   Base URL: {base_url}")
+        logger.info("LLM服务初始化成功 | provider=langchain-openai model={}", model)
 
     return _llm_instance
 

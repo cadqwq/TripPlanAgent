@@ -89,21 +89,94 @@
           <template v-else>正在生成中，请耐心等待...</template>
         </a-button>
       </a-form-item>
+
+      <!-- 进度条（规划中显示） -->
+      <div v-if="loading" class="progress-section">
+        <a-steps :current="progressStep" size="small" direction="vertical">
+          <a-step v-for="step in progressSteps" :key="step.key"
+            :title="step.title"
+            :description="currentStepKey === step.key ? progressMessage : ''"
+            :status="step.status"
+          />
+        </a-steps>
+      </div>
     </a-form>
   </a-card>
 </div>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, watch } from 'vue'
+import { ref, reactive, watch, computed, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
-import { generateTripPlan } from '@/services/api'
+import { generateTripPlan, getProgress } from '@/services/api'
 import type { TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
 
 const router = useRouter()
 const loading = ref(false)
+const progressMessage = ref('')
+const currentStepKey = ref('')
+let progressTimer: ReturnType<typeof setInterval> | null = null
+
+// 进度步骤映射
+const STEP_MAP: Record<string, number> = {
+  idle: -1,
+  searching: 0,
+  planning: 1,
+  reviewing: 2,
+  revising: 1,  // 回退到 planning
+  enriching: 3,
+  done: 4,
+}
+
+const progressSteps = computed(() => {
+  const key = currentStepKey.value
+  return [
+    { key: 'searching', title: '搜索景点、天气、酒店', status: getStatus('searching') },
+    { key: 'planning', title: '生成旅行计划', status: getStatus('planning') },
+    { key: 'reviewing', title: '审查计划质量', status: getStatus('reviewing') },
+    { key: 'enriching', title: '景点配图', status: getStatus('enriching') },
+    { key: 'done', title: '完成', status: getStatus('done') },
+  ]
+})
+
+function getStatus(stepKey: string): 'wait' | 'process' | 'finish' {
+  const currentIdx = STEP_MAP[currentStepKey.value] ?? -1
+  const stepIdx = STEP_MAP[stepKey] ?? -1
+  if (stepIdx < currentIdx) return 'finish'
+  if (stepIdx === currentIdx) return 'process'
+  return 'wait'
+}
+
+const progressStep = computed(() => {
+  const idx = STEP_MAP[currentStepKey.value]
+  return idx >= 0 ? idx : 0
+})
+
+function startPolling(traceId: string) {
+  progressTimer = setInterval(async () => {
+    try {
+      const p = await getProgress(traceId)
+      currentStepKey.value = p.step
+      progressMessage.value = p.message
+      if (p.step === 'done') {
+        stopPolling()
+      }
+    } catch {
+      // 轮询失败忽略，下次再试
+    }
+  }, 800)
+}
+
+function stopPolling() {
+  if (progressTimer) {
+    clearInterval(progressTimer)
+    progressTimer = null
+  }
+}
+
+onBeforeUnmount(() => stopPolling())
 
 const formData = reactive<TripFormData & { start_date: Dayjs | null; end_date: Dayjs | null }>({
   city: '',
@@ -152,11 +225,14 @@ const handleSubmit = async () => {
       free_text_input: formData.free_text_input
     }
 
-    console.log('[Home] Sending request:', requestData)
-    const response = await generateTripPlan(requestData)
+    // 生成 trace_id，发请求同时开始轮询进度
+    const traceId = Math.random().toString(36).slice(2, 10)
+    startPolling(traceId)
+
+    console.log('[Home] Sending request, trace_id:', traceId)
+    const response = await generateTripPlan(requestData, traceId)
+    stopPolling()
     console.log('[Home] API response:', response)
-    console.log('[Home] response.success:', response.success)
-    console.log('[Home] response.data keys:', response.data ? Object.keys(response.data) : 'null')
 
     if (response.success && response.data) {
       const jsonStr = JSON.stringify(response.data)
@@ -164,21 +240,19 @@ const handleSubmit = async () => {
       try {
         sessionStorage.setItem('tripPlan', jsonStr)
         console.log('[Home] sessionStorage set OK')
+        currentStepKey.value = 'done'
+        progressMessage.value = '规划完成！正在跳转...'
         message.success('旅行计划生成成功！')
         setTimeout(() => {
-          console.log('[Home] Navigating to /result')
+          stopPolling()
           router.push('/result')
-        }, 500)
+        }, 800)
       } catch (storageError: any) {
         console.error('[Home] sessionStorage error:', storageError)
         message.error('数据存储失败: ' + storageError.message)
       }
     } else {
-      console.error('[Home] Response invalid:', {
-        success: response.success,
-        hasData: !!response.data,
-        message: response.message
-      })
+      console.error('[Home] Response invalid:', response)
       message.error(response.message || '生成失败')
     }
   } catch (error: any) {
@@ -257,5 +331,13 @@ const handleSubmit = async () => {
 
 .days-unit {
   font-size: 14px;
+}
+
+.progress-section {
+  margin-top: 24px;
+  padding: 20px 24px;
+  background: #fafafa;
+  border-radius: 12px;
+  border: 1px solid #f0f0f0;
 }
 </style>

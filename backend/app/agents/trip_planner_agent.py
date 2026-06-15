@@ -24,34 +24,20 @@ Agent 拓扑:
 import sys
 import os
 import json
+import gc
+import uuid
 import traceback
 from datetime import datetime, timedelta
 from typing import TypedDict, Literal
+from contextvars import ContextVar
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ===== 修复 Windows GBK 编码问题 =====
-os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-import builtins as _builtins
-
-_super_print = _builtins.print
-
-def _utf8_safe_print(*args, **kw):
-    try:
-        _super_print(*args, **kw)
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        try:
-            safe = [str(a).encode('ascii', errors='replace').decode('ascii') for a in args]
-            _super_print(*safe, **kw)
-        except Exception:
-            pass
-
-_builtins.print = _utf8_safe_print
-# =====
-
+from loguru import logger
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..services.llm_service import get_llm, get_llm_json_mode
-from ..models.schemas import TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo, Location, Hotel, Budget
+from ..models.schemas import TripRequest, TripPlan, DayPlan, Attraction, Meal, Location
 from .tools import (
     ATTRACTION_TOOLS,
     WEATHER_TOOLS,
@@ -62,6 +48,37 @@ from .tools import (
     search_hotels,
     plan_route_between,
 )
+
+# ============================================================
+# 0. trace_id 上下文 — 贯穿一次请求的所有 Agent 调用
+# ============================================================
+
+_trace_id: ContextVar[str] = ContextVar("trace_id", default="")
+
+# 进度存储：trace_id → {step, message, timestamp}（自动清理超过 5 分钟的旧条目）
+import time as _time
+_progress_store: dict = {}
+
+def get_progress(trace_id: str) -> dict:
+    """查询某个任务的当前进度"""
+    return _progress_store.get(trace_id, {"step": "idle", "message": "等待中..."})
+
+def _update_progress(tid: str, step: str, message: str):
+    """更新进度（供 Agent 节点调用），并清理超过 5 分钟的旧条目"""
+    _progress_store[tid] = {"step": step, "message": message, "ts": _time.time()}
+    # 每 10 次更新清理一次旧条目
+    if len(_progress_store) > 20:
+        now = _time.time()
+        stale = [k for k, v in _progress_store.items() if now - v.get("ts", 0) > 300]
+        for k in stale:
+            del _progress_store[k]
+
+def _log(level: str, msg: str, *args, **kwargs):
+    """带 trace_id 的结构化日志 + 进度更新"""
+    tid = _trace_id.get("")
+    prefix = f"[trace={tid}] " if tid else ""
+    getattr(logger, level)(f"{prefix}{msg}", *args, **kwargs)
+
 
 # ============================================================
 # 1. 共享状态定义（Agent间的"黑板"）
@@ -127,10 +144,14 @@ def _run_tool_agent(
     """
     llm = get_llm().bind_tools(tools)
 
-    response = llm.invoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_query),
-    ])
+    try:
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_query),
+        ])
+    except Exception as e:
+        _log("error", "LLM调用失败 | error={}", str(e))
+        return json.dumps({"error": f"LLM调用失败: {str(e)}"}, ensure_ascii=False)
 
     # 检查 LLM 是否发起了工具调用
     tool_calls = getattr(response, 'tool_calls', []) or []
@@ -142,12 +163,12 @@ def _run_tool_agent(
                 result = _TOOL_MAP[name].invoke(tc['args'])
                 return result if isinstance(result, str) else str(result)
             except Exception as e:
-                print(f"⚠️  工具 {name} 执行失败: {e}")
+                _log("warning", "工具调用失败 | tool={} error={}", name, str(e))
                 return json.dumps({"error": str(e)}, ensure_ascii=False)
 
     # LLM 没有调用工具，返回它的文本回复
     content = getattr(response, 'content', '') or str(response)
-    print(f"⚠️  {expected_tool} Agent 未调用工具，返回文本: {content[:100]}...")
+    _log("warning", "Agent未调用工具 | expected={} fallback_text={:100}", expected_tool, content)
     return content
 
 
@@ -167,7 +188,8 @@ def attraction_agent(state: TripPlanState) -> dict:
     prefs = state.get('preferences', [])
     keywords = '、'.join(prefs) if prefs else '热门景点'
 
-    print(f"📍 [Attraction Agent] 搜索 {city} 的 {keywords} 相关景点...")
+    _update_progress(_trace_id.get(), "searching", f"正在搜索{city}的{keywords}相关景点...")
+    _log("info", "[AttractionAgent] 开始搜索 | city={} keywords={}", city, keywords)
 
     result = _run_tool_agent(
         system_prompt=(
@@ -179,7 +201,7 @@ def attraction_agent(state: TripPlanState) -> dict:
         expected_tool="search_attractions",
     )
 
-    print(f"📍 [Attraction Agent] 完成，结果长度: {len(result)} 字符")
+    _log("info", "[AttractionAgent] 完成 | result_chars={}", len(result))
     return {"attractions_raw": result}
 
 
@@ -193,7 +215,8 @@ def weather_agent(state: TripPlanState) -> dict:
     """
     city = state['city']
 
-    print(f"🌤️  [Weather Agent] 查询 {city} 天气...")
+    _update_progress(_trace_id.get(), "searching", f"正在查询{city}天气...")
+    _log("info", "[WeatherAgent] 开始查询 | city={}", city)
 
     result = _run_tool_agent(
         system_prompt=(
@@ -205,7 +228,7 @@ def weather_agent(state: TripPlanState) -> dict:
         expected_tool="query_weather",
     )
 
-    print(f"🌤️  [Weather Agent] 完成，结果长度: {len(result)} 字符")
+    _log("info", "[WeatherAgent] 完成 | result_chars={}", len(result))
     return {"weather_raw": result}
 
 
@@ -220,7 +243,8 @@ def hotel_agent(state: TripPlanState) -> dict:
     city = state['city']
     accommodation = state.get('accommodation', '酒店')
 
-    print(f"🏨 [Hotel Agent] 搜索 {city} 的 {accommodation}...")
+    _update_progress(_trace_id.get(), "searching", f"正在搜索{city}的{accommodation}...")
+    _log("info", "[HotelAgent] 开始搜索 | city={} accommodation={}", city, accommodation)
 
     result = _run_tool_agent(
         system_prompt=(
@@ -232,7 +256,7 @@ def hotel_agent(state: TripPlanState) -> dict:
         expected_tool="search_hotels",
     )
 
-    print(f"🏨 [Hotel Agent] 完成，结果长度: {len(result)} 字符")
+    _log("info", "[HotelAgent] 完成 | result_chars={}", len(result))
     return {"hotels_raw": result}
 
 
@@ -244,7 +268,9 @@ def planner_agent(state: TripPlanState) -> dict:
     输入: attractions_raw + weather_raw + hotels_raw + review_result(如果有)
     产出: draft_plan
     """
-    print(f"📋 [Planner Agent] 第 {state.get('iteration', 0) + 1} 轮规划...")
+    r = state.get('iteration', 0) + 1
+    _update_progress(_trace_id.get(), "planning", f"正在生成旅行计划...（第{r}轮）")
+    _log("info", "[PlannerAgent] 开始规划 | round={}", r)
 
     llm = get_llm_json_mode()
 
@@ -261,95 +287,25 @@ def planner_agent(state: TripPlanState) -> dict:
 - 改进建议: {json.dumps(suggestions, ensure_ascii=False, indent=2)}
 """
 
-    prompt = f"""你是一位资深的旅行规划师。请根据以下信息生成一份详细的旅行计划。
+    prompt = f"""为{state['city']}生成{state['travel_days']}天旅行计划。
 
-**目的地信息:**
-- 城市: {state['city']}
-- 日期: {state['start_date']} 至 {state['end_date']}
-- 天数: {state['travel_days']} 天
-- 交通方式: {state['transportation']}
-- 住宿偏好: {state['accommodation']}
-- 旅行偏好: {', '.join(state.get('preferences', [])) or '无特殊偏好'}
-- 额外要求: {state.get('free_text_input', '无')}
+城市={state['city']} 日期={state['start_date']}~{state['end_date']} 交通={state['transportation']} 住宿={state['accommodation']}
+偏好={', '.join(state.get('preferences', [])) or '无'} 额外要求={state.get('free_text_input', '无')}
 
-**景点数据:**
-{state.get('attractions_raw', '暂无景点数据')}
+景点数据:
+{state.get('attractions_raw', '暂无')[:3000]}
 
-**天气数据:**
-{state.get('weather_raw', '暂无天气数据')}
+天气:
+{state.get('weather_raw', '暂无')[:1000]}
 
-**酒店数据:**
-{state.get('hotels_raw', '暂无酒店数据')}
+酒店:
+{state.get('hotels_raw', '暂无')[:2000]}
 
 {feedback_section}
-**要求:**
-1. 每天安排2-3个景点，景点之间距离合理
-2. 每天必须包含早、中、晚三餐
-3. 每天推荐一个具体酒店（从酒店数据中选择）
-4. 考虑天气情况调整行程（雨天多安排室内景点）
-5. 提供完整的预算估算
-6. 景点的经纬度坐标必须基于真实数据
+规则: 每天2-3景点，早中晚三餐，从数据中选酒店，经纬度必须真实。
 
-**返回严格的 JSON 格式（不要 markdown 代码块标记）:**
-{{
-  "city": "{state['city']}",
-  "start_date": "{state['start_date']}",
-  "end_date": "{state['end_date']}",
-  "days": [
-    {{
-      "date": "YYYY-MM-DD",
-      "day_index": 0,
-      "description": "第1天行程概述，200字以内",
-      "transportation": "{state['transportation']}",
-      "accommodation": "{state['accommodation']}",
-      "hotel": {{
-        "name": "酒店名称",
-        "address": "酒店地址",
-        "location": {{"longitude": 116.397, "latitude": 39.916}},
-        "price_range": "300-500元",
-        "rating": "4.5",
-        "distance": "距离景点2公里",
-        "type": "{state['accommodation']}",
-        "estimated_cost": 400
-      }},
-      "attractions": [
-        {{
-          "name": "景点名称",
-          "address": "详细地址",
-          "location": {{"longitude": 116.397, "latitude": 39.916}},
-          "visit_duration": 120,
-          "description": "景点描述，100字以内",
-          "category": "景点类别",
-          "ticket_price": 60
-        }}
-      ],
-      "meals": [
-        {{"type": "breakfast", "name": "早餐推荐", "description": "特色早餐", "estimated_cost": 30}},
-        {{"type": "lunch", "name": "午餐推荐", "description": "午餐推荐", "estimated_cost": 50}},
-        {{"type": "dinner", "name": "晚餐推荐", "description": "晚餐推荐", "estimated_cost": 80}}
-      ]
-    }}
-  ],
-  "weather_info": [
-    {{
-      "date": "YYYY-MM-DD",
-      "day_weather": "晴",
-      "night_weather": "多云",
-      "day_temp": 25,
-      "night_temp": 15,
-      "wind_direction": "南风",
-      "wind_power": "1-3级"
-    }}
-  ],
-  "overall_suggestions": "旅行总体建议，300字以内",
-  "budget": {{
-    "total_attractions": 180,
-    "total_hotels": 1200,
-    "total_meals": 480,
-    "total_transportation": 200,
-    "total": 2060
-  }}
-}}
+返回JSON(无markdown标记):
+{{"city":"{state['city']}","start_date":"{state['start_date']}","end_date":"{state['end_date']}","days":[{{"date":"YYYY-MM-DD","day_index":0,"description":"50字内","transportation":"{state['transportation']}","accommodation":"{state['accommodation']}","hotel":{{"name":"..","address":"..","location":{{"longitude":116.397,"latitude":39.916}},"price_range":"..","rating":"..","distance":"..","type":"{state['accommodation']}","estimated_cost":0}},"attractions":[{{"name":"..","address":"..","location":{{"longitude":116.397,"latitude":39.916}},"visit_duration":120,"description":"30字内","category":"..","ticket_price":0,"image_url":""}}],"meals":[{{"type":"breakfast","name":"..","description":"..","estimated_cost":30}},{{"type":"lunch","name":"..","description":"..","estimated_cost":50}},{{"type":"dinner","name":"..","description":"..","estimated_cost":80}}]}}],"weather_info":[{{"date":"..","day_weather":"..","night_weather":"..","day_temp":25,"night_temp":15,"wind_direction":"..","wind_power":".."}}],"overall_suggestions":"80字内","budget":{{"total_attractions":0,"total_hotels":0,"total_meals":0,"total_transportation":0,"total":0}}}}
 """
 
     try:
@@ -369,15 +325,14 @@ def planner_agent(state: TripPlanState) -> dict:
         plan = json.loads(content)
         iteration = state.get('iteration', 0) + 1
 
-        print(f"📋 [Planner Agent] 第 {iteration} 轮规划完成")
+        _log("info", "[PlannerAgent] 完成 | round={}", iteration)
         return {
             "draft_plan": plan,
             "iteration": iteration,
         }
 
     except json.JSONDecodeError as e:
-        print(f"❌ [Planner Agent] JSON 解析失败: {e}")
-        print(f"   原始内容前200字符: {content[:200]}")
+        _log("error", "[PlannerAgent] JSON解析失败 | error={} raw={:200}", str(e), content)
         raise
 
 
@@ -398,84 +353,28 @@ def reviewer_agent(state: TripPlanState) -> dict:
     """
     plan = state.get('draft_plan', {})
     if not plan:
-        print("⚠️  [Reviewer Agent] 没有可审查的计划，跳过")
+        _log("warning", "[ReviewerAgent] 无计划可审查，跳过")
         return {"review_result": {"score": 1.0, "passes": [], "issues": [], "suggestions": []}}
 
-    print(f"🔍 [Reviewer Agent] 审查计划... ({state.get('iteration', 0)} 轮)")
+    _update_progress(_trace_id.get(), "reviewing", "正在审查旅行计划质量...")
+    _log("info", "[ReviewerAgent] 开始审查 | round={}", state.get('iteration', 0))
 
     llm = get_llm_json_mode()
 
-    # 提取关键信息用于审查
     days = plan.get('days', [])
     day_count = len(days)
 
-    # 实际验证景点间距离（抽样检查每天前2个景点间距离）
-    route_checks = []
-    for day in days:
-        attractions = day.get('attractions', [])
-        if len(attractions) >= 2:
-            a1 = attractions[0]
-            a2 = attractions[1]
-            try:
-                route_result = plan_route_between.invoke({
-                    "origin_address": a1.get('address', ''),
-                    "destination_address": a2.get('address', ''),
-                    "route_type": "walking",
-                })
-                route_checks.append({
-                    "day": day.get('day_index', 0),
-                    "from": a1.get('name', '?'),
-                    "to": a2.get('name', '?'),
-                    "route_data": route_result[:300],
-                })
-            except Exception as e:
-                route_checks.append({
-                    "day": day.get('day_index', 0),
-                    "from": a1.get('name', '?'),
-                    "to": a2.get('name', '?'),
-                    "error": str(e),
-                })
+    prompt = f"""审查此{day_count}天旅行计划，5维度打分(0-1):
+地理合理性(0.30): 景点距离是否合理
+时间可行性(0.25): 游览+交通≤10h/天
+预算准确性(0.15): 各项加总=total
+多样性(0.15): 类型不单一
+偏好匹配(0.15): 覆盖{state.get('preferences', [])}
 
-    prompt = f"""你是一个严格的旅行计划审查专家。审查以下 {day_count} 天旅行计划并打分。
+计划: {json.dumps(plan, ensure_ascii=False)}
 
-**旅行计划:**
-{json.dumps(plan, ensure_ascii=False, indent=2)}
-
-**用户偏好:** {state.get('preferences', [])}
-
-**实测景点间路线数据（抽样）:**
-{json.dumps(route_checks, ensure_ascii=False, indent=2)}
-
-**从以下5个维度评分(0-1)，加权计算总分:**
-
-| 维度 | 权重 | 检查内容 |
-|------|------|---------|
-| 地理合理性 | 0.30 | 相邻景点距离是否合理？实测路线距离是否<5km？一天内景点是否在同一区域？|
-| 时间可行性 | 0.25 | 游览时间+交通时间是否超出每天10小时可用时间？|
-| 预算准确性 | 0.15 | budget.total 是否等于各项加总？各项费用是否合理？|
-| 多样性 | 0.15 | 景点类别是否多样？是否全是同一类型（如全是寺庙）？|
-| 偏好匹配 | 0.15 | 是否覆盖了用户偏好？偏好标签中有多少被实际安排？|
-
-**通过标准:**
-- score ≥ 0.80 → 合格，可以发布
-- score < 0.80 → 不合格，需要 Planner 修正
-
-**返回严格的 JSON 格式（不要 markdown 代码块）:**
-{{
-  "score": 0.85,
-  "dimension_scores": {{
-    "地理合理性": 0.9,
-    "时间可行性": 0.8,
-    "预算准确性": 0.85,
-    "多样性": 0.9,
-    "偏好匹配": 0.8
-  }},
-  "passes": ["地理分布合理，景点集中在同一区域", "预算计算正确"],
-  "issues": [
-    {{"severity": "high", "dimension": "地理合理性", "detail": "第2天故宫和长城相距50km，步行不现实"}}
-  ],
-  "suggestions": ["第2天建议只安排故宫+景山公园，将长城移到第3天"]
-}}
+score≥0.80通过,<0.80需修订。返回JSON(无markdown):
+{{"score":0.85,"dimension_scores":{{"地理合理性":0.9,"时间可行性":0.8,"预算准确性":0.85,"多样性":0.9,"偏好匹配":0.8}},"passes":["..."],"issues":[{{"severity":"high|medium|low","dimension":"..","detail":".."}}],"suggestions":[".."]}}
 """
 
     try:
@@ -496,12 +395,13 @@ def reviewer_agent(state: TripPlanState) -> dict:
 
         score = review.get('score', 0)
         issues_count = len(review.get('issues', []))
-        print(f"🔍 [Reviewer Agent] 评分: {score:.2f} | 问题: {issues_count} 个 | {'✅ 通过' if score >= 0.8 else '❌ 需修正'}")
+        _log("info", "[ReviewerAgent] 完成 | score={:.2f} issues={} status={}",
+             score, issues_count, "PASS" if score >= 0.8 else "REVISE")
 
         return {"review_result": review}
 
     except json.JSONDecodeError as e:
-        print(f"❌ [Reviewer Agent] JSON 解析失败: {e}")
+        _log("error", "[ReviewerAgent] JSON解析失败 | error={}", str(e))
         # 返回一个宽容的审查结果
         return {
             "review_result": {
@@ -517,6 +417,15 @@ def reviewer_agent(state: TripPlanState) -> dict:
 # 4. 路由函数
 # ============================================================
 
+def cleanup_node(state: TripPlanState) -> dict:
+    """释放内存：清空不再需要的原始数据字段"""
+    return {
+        "attractions_raw": "",
+        "weather_raw": "",
+        "hotels_raw": "",
+    }
+
+
 def should_continue(state: TripPlanState) -> Literal["planner", "end"]:
     """
     条件边：审查通过 → 结束，否则 → 回 Planner 修正
@@ -530,14 +439,17 @@ def should_continue(state: TripPlanState) -> Literal["planner", "end"]:
     iteration = state.get('iteration', 0)
 
     if score >= 0.8:
-        print(f"✅ Plan-Verify Loop 结束: 评分 {score:.2f} ≥ 0.8，通过")
+        _update_progress(_trace_id.get(), "done", f"审查通过！（评分 {score:.0%}）")
+        _log("info", "Plan-Verify Loop 通过 | score={:.2f}", score)
         return "end"
 
     if iteration >= 3:
-        print(f"⚠️  Plan-Verify Loop 结束: 已达最大 {iteration} 轮修订，强制通过")
+        _update_progress(_trace_id.get(), "done", "已达最大修订轮次，生成最终计划")
+        _log("warning", "Plan-Verify Loop 强制结束 | max_rounds={}", iteration)
         return "end"
 
-    print(f"🔄 Plan-Verify Loop: 评分 {score:.2f} < 0.8，返回 Planner 修订（第 {iteration + 1} 轮）")
+    _update_progress(_trace_id.get(), "revising", f"评分不达标（{score:.0%}），正在修订计划...（第{iteration+1}轮）")
+    _log("info", "Plan-Verify Loop 继续修订 | score={:.2f} next_round={}", score, iteration + 1)
     return "planner"
 
 
@@ -576,6 +488,7 @@ def build_trip_planner_graph():
     graph.add_node("hotel_agent", hotel_agent)
     graph.add_node("planner_agent", planner_agent)
     graph.add_node("reviewer_agent", reviewer_agent)
+    graph.add_node("cleanup", cleanup_node)
 
     # ---- 添加边 ----
 
@@ -592,15 +505,18 @@ def build_trip_planner_graph():
     # Planner → Reviewer
     graph.add_edge("planner_agent", "reviewer_agent")
 
-    # 条件边: Reviewer → Planner（修订循环）或 END（通过）
+    # 条件边: Reviewer → Planner（修订循环）或 cleanup → END
     graph.add_conditional_edges(
         "reviewer_agent",
         should_continue,
         {
             "planner": "planner_agent",
-            "end": END,
+            "end": "cleanup",
         }
     )
+
+    # cleanup → END
+    graph.add_edge("cleanup", END)
 
     return graph.compile()
 
@@ -618,36 +534,38 @@ class MultiAgentTripPlanner:
 
     def __init__(self):
         """初始化 LangGraph 图"""
-        print("🔄 开始初始化 LangGraph 多智能体旅行规划系统...")
+        logger.info("开始初始化 LangGraph 多智能体旅行规划系统...")
 
         try:
             self.graph = build_trip_planner_graph()
-            print("✅ LangGraph 图构建成功")
-            print("   节点: attraction_agent, weather_agent, hotel_agent, planner_agent, reviewer_agent")
-            print("   拓扑: Fan-out(3并行) → Planner → Reviewer → [条件循环]")
+            logger.info("LangGraph 图构建成功 | nodes=attraction_agent,weather_agent,hotel_agent,planner_agent,reviewer_agent")
+            logger.info("图拓扑: Fan-out(3并行) -> Planner -> Reviewer -> [条件循环]")
         except Exception as e:
-            print(f"❌ LangGraph 图构建失败: {str(e)}")
+            logger.error("LangGraph 图构建失败 | error={}", str(e))
             traceback.print_exc()
             raise
 
-    def plan_trip(self, request: TripRequest) -> TripPlan:
+    def plan_trip(self, request: TripRequest, trace_id: str = "") -> TripPlan:
         """
         使用 LangGraph 多智能体协作生成旅行计划
 
         Args:
             request: 旅行请求
+            trace_id: 可选的任务追踪ID，不传则自动生成
 
         Returns:
             旅行计划
         """
+        # 生成或使用传入的 trace_id，贯穿本次请求的所有 Agent 调用
+        tid = trace_id or str(uuid.uuid4())[:8]
+        _trace_id.set(tid)
+        _update_progress(tid, "searching", "正在搜索景点、天气、酒店信息...")
+
         try:
-            print(f"\n{'='*60}")
-            print(f"🚀 开始 LangGraph 多智能体协作规划...")
-            print(f"目的地: {request.city}")
-            print(f"日期: {request.start_date} 至 {request.end_date}")
-            print(f"天数: {request.travel_days}天")
-            print(f"偏好: {', '.join(request.preferences) if request.preferences else '无'}")
-            print(f"{'='*60}\n")
+            prefs = ', '.join(request.preferences) if request.preferences else '无'
+            _log("info", "========== 开始多智能体协作规划 ==========")
+            _log("info", "请求参数 | city={} dates={}~{} days={} prefs={}",
+                 request.city, request.start_date, request.end_date, request.travel_days, prefs)
 
             # 构建初始状态
             initial_state: TripPlanState = {
@@ -668,7 +586,7 @@ class MultiAgentTripPlanner:
             }
 
             # 执行 LangGraph 图
-            print("⚡ 执行 LangGraph 图...")
+            _log("info", "执行 LangGraph 图...")
             result = self.graph.invoke(initial_state)
 
             # 提取最终计划
@@ -681,19 +599,69 @@ class MultiAgentTripPlanner:
 
             trip_plan = TripPlan(**plan_dict)
 
-            print(f"\n{'='*60}")
-            print(f"✅ 旅行计划生成完成!")
-            print(f"   总修订轮次: {iteration}")
-            print(f"   审查评分: {review.get('score', 'N/A')}")
-            print(f"   行程天数: {len(trip_plan.days)}")
-            print(f"{'='*60}\n")
+            # 自动配图：从 Unsplash 为每个景点获取照片
+            _update_progress(tid, "enriching", "正在为景点配图...")
+            _log("info", "开始为景点配图...")
+            self._enrich_images(trip_plan)
+
+            # 清理内存：删除大字符串、触发 GC、清理过期进度
+            _log("info", "释放内存...")
+            del result
+            if tid in _progress_store:
+                del _progress_store[tid]
+            gc.collect()
+
+            _log("info", "========== 规划完成 | rounds={} score={} days={} ==========",
+                 iteration, review.get('score', 'N/A'), len(trip_plan.days))
 
             return trip_plan
 
         except Exception as e:
-            print(f"❌ LangGraph 规划失败: {str(e)}")
-            traceback.print_exc()
+            # logger.opt(exception=True) 会打印完整调用栈到 loguru
+            logger.opt(exception=True).error("[trace={}] 规划失败 | error={}", tid, str(e))
             return self._create_fallback_plan(request)
+
+    def _enrich_images(self, trip_plan: TripPlan):
+        """
+        为旅行计划中的每个景点自动配图。
+
+        并行调用 Unsplash API，每个景点获取一张照片 URL，
+        写入 attraction.image_url 字段。
+        """
+        from ..services.unsplash_service import get_unsplash_service
+
+        unsplash = get_unsplash_service()
+
+        # 收集所有需要配图的景点
+        attractions = []
+        for day in trip_plan.days:
+            for attr in day.attractions:
+                if not attr.image_url:
+                    attractions.append(attr)
+
+        if not attractions:
+            return
+
+        # 并行获取图片（最多 5 个并发）
+        def fetch_image(attr):
+            try:
+                url = unsplash.get_photo_url(f"{attr.name} {trip_plan.city}")
+                if url:
+                    attr.image_url = url
+                    _log("info", "景点配图成功 | attraction={}", attr.name)
+                else:
+                    _log("warning", "景点配图未找到 | attraction={}", attr.name)
+            except Exception as e:
+                _log("warning", "景点配图失败 | attraction={} error={}", attr.name, str(e))
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = [pool.submit(fetch_image, attr) for attr in attractions]
+            for f in as_completed(futures):
+                f.result()  # 等待全部完成，有异常也会被内部 catch
+
+        total = len(attractions)
+        with_image = sum(1 for a in attractions if a.image_url)
+        _log("info", "配图完成 | total={} with_image={}", total, with_image)
 
     def _create_fallback_plan(self, request: TripRequest) -> TripPlan:
         """创建备用计划（当 LangGraph 执行失败时）"""

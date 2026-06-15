@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     """应用配置"""
 
     # 应用基本配置
-    app_name: str = "HelloAgents智能旅行助手"
+    app_name: str = "TripPlanAgent智能旅行助手"
     app_version: str = "1.0.0"
     debug: bool = False
 
@@ -75,25 +75,59 @@ def validate_config():
         raise ValueError(error_msg)
 
     if warnings:
-        print("\n⚠️  配置警告:")
+        from loguru import logger
         for w in warnings:
-            print(f"  - {w}")
+            logger.warning("配置警告: {}", w)
 
     return True
 
 
+def setup_logging():
+    """配置 loguru 结构化日志"""
+    import sys
+    from loguru import logger
+
+    # 移除默认 handler
+    logger.remove()
+
+    # 控制台输出：彩色格式
+    logger.add(
+        sys.stderr,
+        format=(
+            "<green>{time:HH:mm:ss}</green> | "
+            "<level>{level: <8}</level> | "
+            "<level>{message}</level>"
+        ),
+        level=settings.log_level,
+        colorize=True,
+    )
+
+    # 文件输出：结构化格式（便于后续接入 ELK/Loki）
+    logger.add(
+        "logs/trip_agent_{time:YYYY-MM-DD}.log",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
+        level="DEBUG",
+        rotation="10 MB",
+        retention="7 days",
+        encoding="utf-8",
+    )
+
+    return logger
+
+
 def print_config():
     """打印当前配置(隐藏敏感信息)"""
-    print(f"应用名称: {settings.app_name}")
-    print(f"版本: {settings.app_version}")
-    print(f"服务器: {settings.host}:{settings.port}")
-    print(f"高德地图API Key: {'已配置' if settings.amap_api_key else '未配置'}")
+    from loguru import logger
+    logger.info("应用名称: {}", settings.app_name)
+    logger.info("版本: {}", settings.app_version)
+    logger.info("服务器: {}:{}", settings.host, settings.port)
+    logger.info("高德地图API Key: {}", '已配置' if settings.amap_api_key else '未配置')
 
     llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     llm_base_url = os.getenv("LLM_BASE_URL") or settings.openai_base_url
     llm_model = os.getenv("LLM_MODEL_ID") or settings.openai_model
 
-    print(f"LLM API Key: {'已配置' if llm_api_key else '未配置'}")
-    print(f"LLM Base URL: {llm_base_url}")
-    print(f"LLM Model: {llm_model}")
-    print(f"日志级别: {settings.log_level}")
+    logger.info("LLM API Key: {}", '已配置' if llm_api_key else '未配置')
+    logger.info("LLM Base URL: {}", llm_base_url)
+    logger.info("LLM Model: {}", llm_model)
+    logger.info("日志级别: {}", settings.log_level)

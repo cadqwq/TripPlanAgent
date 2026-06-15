@@ -1,9 +1,9 @@
 """高德地图服务封装 — 直接调用高德 REST API"""
 
 import json
-import time
 from typing import List, Dict, Any, Optional
 import httpx
+from loguru import logger
 from ..config import get_settings
 
 # 高德地图 API 基础地址
@@ -19,7 +19,7 @@ class AmapService:
             raise ValueError("高德地图API Key未配置，请在.env文件中设置AMAP_API_KEY")
         self.api_key = settings.amap_api_key
         self._client = httpx.Client(timeout=15.0)
-        print(f"✅  高德地图服务初始化成功 (REST API)")
+        logger.info("高德地图服务初始化成功 (REST API)")
 
     def _get(self, path: str, params: dict) -> dict:
         """统一 GET 请求"""
@@ -30,11 +30,11 @@ class AmapService:
             resp.raise_for_status()
             data = resp.json()
             if data.get("status") != "1":
-                print(f"⚠️  高德API返回异常: {data.get('info', 'unknown')} (path={path})")
+                logger.warning("高德API返回异常 | info={} path={}", data.get('info', 'unknown'), path)
                 return {}
             return data
         except Exception as e:
-            print(f"❌  高德API请求失败 [{path}]: {e}")
+            logger.error("高德API请求失败 | path={} error={}", path, e)
             return {}
 
     # ==================== POI 搜索 ====================
@@ -84,7 +84,7 @@ class AmapService:
                 "photos": [pic.get("url") for pic in p.get("photos", [])],
             })
 
-        print(f"✅  POI搜索 '{keywords}' @ '{city}': {len(results)} 条")
+        logger.info("POI搜索完成 | keywords={} city={} count={}", keywords, city, len(results))
         return results
 
     # ==================== 天气查询 ====================
@@ -138,7 +138,7 @@ class AmapService:
                     "wind_power": live.get("windpower", ""),
                 })
 
-        print(f"✅  天气查询 '{city}': {len(results)} 天")
+        logger.info("天气查询完成 | city={} days={}", city, len(results))
         return results
 
     def _get_adcode(self, city: str) -> str:
@@ -237,7 +237,7 @@ class AmapService:
             return {}
 
         except Exception as e:
-            print(f"❌  路线规划失败: {e}")
+            logger.error("路线规划失败 | error={}", e)
             return {}
 
     def _geocode_address(self, address: str, city: Optional[str] = None) -> Optional[tuple]:

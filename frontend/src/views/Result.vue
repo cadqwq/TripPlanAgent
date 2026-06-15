@@ -55,6 +55,9 @@
           <a-row :gutter="16">
             <a-col :span="12" v-for="(attr, i) in day.attractions" :key="i">
               <a-card :title="attr.name" size="small" style="margin-bottom: 16px">
+                <div v-if="attr.image_url" class="attraction-image">
+                  <img :src="attr.image_url" :alt="attr.name" />
+                </div>
                 <p><strong>地址：</strong>{{ attr.address }}</p>
                 <p><strong>游览时长：</strong>{{ attr.visit_duration }}分钟</p>
                 <p><strong>描述：</strong>{{ attr.description }}</p>
@@ -138,6 +141,20 @@ const goBack = () => {
 </script>
 
 <style scoped>
+.attraction-image {
+  width: 100%;
+  height: 160px;
+  overflow: hidden;
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.attraction-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
 .result-container {
   min-height: 100vh;
   background: #f5f7fa;

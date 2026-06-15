@@ -25,7 +25,8 @@
       "PowerShell(& 'D:\\\\ProgramData\\\\anaconda3_n\\\\python.exe' -m pip install fastmcp 2>&1)",
       "PowerShell(& 'D:\\\\ProgramData\\\\anaconda3_n\\\\python.exe' -m pip install fastapi uvicorn pydantic pydantic-settings httpx aiohttp python-dotenv python-multipart loguru python-dateutil 2>&1 | Select-Object -Last 5)",
       "PowerShell(& 'D:\\\\ProgramData\\\\anaconda3_n\\\\python.exe' 'D:\\\\MycCode\\\\TripPlanAgent\\\\backend\\\\test_startup.py' 2>&1)",
-      "Bash(/usr/bin/rm -f /d/MycCode/TripPlanAgent/stdout.txt /d/MycCode/TripPlanAgent/stderr.txt)"
+      "Bash(/usr/bin/rm -f /d/MycCode/TripPlanAgent/stdout.txt /d/MycCode/TripPlanAgent/stderr.txt)",
+      "Bash(/d/ProgramData/anaconda3_n/python.exe *)"
     ]
   }
 }

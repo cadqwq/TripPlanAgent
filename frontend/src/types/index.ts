@@ -96,5 +96,13 @@ export interface TripFormData {
 export interface TripPlanResponse {
   success: boolean
   message: string
+  trace_id?: string
   data?: TripPlan
+}
+
+/** 进度查询响应 */
+export interface ProgressResponse {
+  trace_id: string
+  step: string
+  message: string
 }
