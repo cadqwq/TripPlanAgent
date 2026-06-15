@@ -1,0 +1,26 @@
+# === 环境变量（含 API 密钥，绝对不能提交） ===
+.env
+*.env
+!.env.example
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# === Node ===
+node_modules/
+dist/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === 系统 ===
+.DS_Store
+Thumbs.db
+*.log
