@@ -31,11 +31,6 @@ class Settings(BaseSettings):
     unsplash_access_key: str = ""
     unsplash_secret_key: str = ""
 
-    # LLM配置
-    openai_api_key: str = ""
-    openai_base_url: str = "https://api.openai.com/v1"
-    openai_model: str = "gpt-4"
-
     # 日志配置
     log_level: str = "INFO"
 
@@ -124,8 +119,8 @@ def print_config():
     logger.info("高德地图API Key: {}", '已配置' if settings.amap_api_key else '未配置')
 
     llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
-    llm_base_url = os.getenv("LLM_BASE_URL") or settings.openai_base_url
-    llm_model = os.getenv("LLM_MODEL_ID") or settings.openai_model
+    llm_base_url = os.getenv("LLM_BASE_URL") or "https://api.deepseek.com"
+    llm_model = os.getenv("LLM_MODEL_ID") or "deepseek-v4-pro"
 
     logger.info("LLM API Key: {}", '已配置' if llm_api_key else '未配置')
     logger.info("LLM Base URL: {}", llm_base_url)

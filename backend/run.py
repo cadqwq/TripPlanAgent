@@ -1,6 +1,4 @@
 """启动脚本"""
-import sys
-import os
 import uvicorn
 from app.config import get_settings
 
